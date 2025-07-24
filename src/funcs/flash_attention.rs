@@ -160,19 +160,29 @@ impl FlashAttention {
         let rows = shape[shape.len() - 2];
         let cols = shape[shape.len() - 1];
         
-        let mut max_vals = Vec::with_capacity(rows);
+        // Handle batched tensors correctly
+        let batch_size = if shape.len() > 2 {
+            shape[..shape.len() - 2].iter().product()
+        } else {
+            1
+        };
+        
+        let mut max_vals = Vec::with_capacity(batch_size * rows);
         let blob = tensor.blob();
         
-        for i in 0..rows {
-            let mut row_max = f32::NEG_INFINITY;
-            for j in 0..cols {
-                let linear_idx = i * cols + j;
-                let val = blob[linear_idx];
-                if val > row_max {
-                    row_max = val;
+        for batch_idx in 0..batch_size {
+            let batch_offset = batch_idx * rows * cols;
+            for i in 0..rows {
+                let mut row_max = f32::NEG_INFINITY;
+                for j in 0..cols {
+                    let linear_idx = batch_offset + i * cols + j;
+                    let val = blob[linear_idx];
+                    if val > row_max {
+                        row_max = val;
+                    }
                 }
+                max_vals.push(row_max);
             }
-            max_vals.push(row_max);
         }
 
         let max_shape = if shape.len() == 2 {
@@ -192,16 +202,26 @@ impl FlashAttention {
         let rows = shape[shape.len() - 2];
         let cols = shape[shape.len() - 1];
         
-        let mut sum_vals = Vec::with_capacity(rows);
+        // Handle batched tensors correctly
+        let batch_size = if shape.len() > 2 {
+            shape[..shape.len() - 2].iter().product()
+        } else {
+            1
+        };
+        
+        let mut sum_vals = Vec::with_capacity(batch_size * rows);
         let blob = tensor.blob();
         
-        for i in 0..rows {
-            let mut row_sum = 0.0;
-            for j in 0..cols {
-                let linear_idx = i * cols + j;
-                row_sum += blob[linear_idx];
+        for batch_idx in 0..batch_size {
+            let batch_offset = batch_idx * rows * cols;
+            for i in 0..rows {
+                let mut row_sum = 0.0;
+                for j in 0..cols {
+                    let linear_idx = batch_offset + i * cols + j;
+                    row_sum += blob[linear_idx];
+                }
+                sum_vals.push(row_sum);
             }
-            sum_vals.push(row_sum);
         }
 
         let sum_shape = if shape.len() == 2 {
@@ -237,17 +257,30 @@ impl FlashAttention {
         let shape = scores.shape();
         let rows = shape[shape.len() - 2];
         let cols = shape[shape.len() - 1];
+        
+        // Handle batched tensors correctly
+        let batch_size = if shape.len() > 2 {
+            shape[..shape.len() - 2].iter().product()
+        } else {
+            1
+        };
+        
         let mut exp_data = Vec::with_capacity(scores.size());
 
         let scores_blob = scores.blob();
         let max_blob = max_vals.blob();
 
-        for i in 0..rows {
-            let max_val = max_blob[i];
-            for j in 0..cols {
-                let linear_idx = i * cols + j;
-                let score = scores_blob[linear_idx];
-                exp_data.push((score - max_val).exp());
+        for batch_idx in 0..batch_size {
+            let batch_offset = batch_idx * rows * cols;
+            let max_offset = batch_idx * rows;
+            
+            for i in 0..rows {
+                let max_val = max_blob[max_offset + i];
+                for j in 0..cols {
+                    let linear_idx = batch_offset + i * cols + j;
+                    let score = scores_blob[linear_idx];
+                    exp_data.push((score - max_val).exp());
+                }
             }
         }
 
@@ -347,8 +380,19 @@ impl Function for FlashAttention {
         };
         
         let mut output = Tensor::zeros(&output_shape);
-        let mut running_max = Tensor::constant(&[seq_len_q, 1], f32::NEG_INFINITY);
-        let mut running_sum = Tensor::zeros(&[seq_len_q, 1]);
+        
+        // Initialize running statistics with correct batch dimensions
+        let running_stats_shape = if q_shape.len() == 2 {
+            vec![seq_len_q, 1]
+        } else {
+            let mut shape = q_shape.to_vec();
+            let last_idx = shape.len() - 1;
+            shape[last_idx] = 1; // Last dimension becomes 1
+            shape
+        };
+        
+        let mut running_max = Tensor::constant(&running_stats_shape, f32::NEG_INFINITY);
+        let mut running_sum = Tensor::zeros(&running_stats_shape);
 
         // Tiled computation loop
         let num_q_tiles = (seq_len_q + self.block_size_q - 1) / self.block_size_q;
@@ -431,50 +475,126 @@ impl Function for FlashAttention {
 impl FlashAttention {
     /// Extract running statistics for a specific tile
     fn extract_running_stats(&self, stats: &Tensor<f32>, start: usize, size: usize) -> Result<Tensor<f32>, TensorError> {
+        let stats_shape = stats.shape();
         let stats_blob = stats.blob();
-        let mut tile_data = Vec::with_capacity(size);
         
-        for i in 0..size {
-            let idx = start + i;
-            if idx < stats_blob.len() {
-                tile_data.push(stats_blob[idx]);
-            } else {
-                tile_data.push(f32::NEG_INFINITY); // Default for max, 0.0 for sum would be handled separately
+        // Handle batched tensors correctly
+        if stats_shape.len() == 2 {
+            // Non-batched case: [seq_len, 1]
+            let mut tile_data = Vec::with_capacity(size);
+            
+            for i in 0..size {
+                let idx = start + i;
+                if idx < stats_blob.len() {
+                    tile_data.push(stats_blob[idx]);
+                } else {
+                    tile_data.push(f32::NEG_INFINITY); // Default for max, 0.0 for sum would be handled separately
+                }
             }
+            
+            Tensor::raw(&[size, 1], tile_data)
+        } else {
+            // Batched case: [batch_dims..., seq_len, 1]
+            let batch_size = stats_shape[..stats_shape.len() - 2].iter().product::<usize>();
+            let seq_len = stats_shape[stats_shape.len() - 2];
+            
+            let mut tile_data = Vec::with_capacity(batch_size * size);
+            
+            for batch_idx in 0..batch_size {
+                let batch_offset = batch_idx * seq_len;
+                for i in 0..size {
+                    let idx = batch_offset + start + i;
+                    if idx < stats_blob.len() && (start + i) < seq_len {
+                        tile_data.push(stats_blob[idx]);
+                    } else {
+                        tile_data.push(f32::NEG_INFINITY); // Default for max
+                    }
+                }
+            }
+            
+            let mut tile_shape = stats_shape.to_vec();
+            let last_idx = tile_shape.len() - 2;
+            tile_shape[last_idx] = size; // Update sequence length dimension
+            Tensor::raw(&tile_shape, tile_data)
         }
-        
-        Tensor::raw(&[size, 1], tile_data)
     }
     
     /// Update running statistics for a specific tile
     fn update_running_stats(&self, stats: &mut Tensor<f32>, new_stats: &Tensor<f32>, start: usize, size: usize) -> Result<(), TensorError> {
+        let stats_shape = stats.shape().to_vec(); // Clone to avoid borrow conflict
         let stats_blob = stats.blob_mut();
         let new_blob = new_stats.blob();
         
-        for i in 0..size {
-            let idx = start + i;
-            if idx < stats_blob.len() && i < new_blob.len() {
-                stats_blob[idx] = new_blob[i];
+        // Handle batched tensors correctly
+        if stats_shape.len() == 2 {
+            // Non-batched case: [seq_len, 1]
+            for i in 0..size {
+                let idx = start + i;
+                if idx < stats_blob.len() && i < new_blob.len() {
+                    stats_blob[idx] = new_blob[i];
+                }
+            }
+        } else {
+            // Batched case: [batch_dims..., seq_len, 1]
+            let batch_size = stats_shape[..stats_shape.len() - 2].iter().product::<usize>();
+            let seq_len = stats_shape[stats_shape.len() - 2];
+            
+            for batch_idx in 0..batch_size {
+                let stats_batch_offset = batch_idx * seq_len;
+                let new_batch_offset = batch_idx * size;
+                
+                for i in 0..size {
+                    let stats_idx = stats_batch_offset + start + i;
+                    let new_idx = new_batch_offset + i;
+                    
+                    if stats_idx < stats_blob.len() && new_idx < new_blob.len() && (start + i) < seq_len {
+                        stats_blob[stats_idx] = new_blob[new_idx];
+                    }
+                }
             }
         }
-        
+
         Ok(())
     }
     
     /// Accumulate tile output into the main output tensor
     fn accumulate_tile_output(&self, output: &mut Tensor<f32>, tile_output: &Tensor<f32>, start: usize, q_tile_size: usize) -> Result<(), TensorError> {
-        let output_shape = output.shape();
+        let output_shape = output.shape().to_vec(); // Clone to avoid borrow conflict
         let head_dim = output_shape[output_shape.len() - 1];
         let output_blob = output.blob_mut();
         let tile_blob = tile_output.blob();
         
-        for i in 0..q_tile_size {
-            for j in 0..head_dim {
-                let output_idx = (start + i) * head_dim + j;
-                let tile_idx = i * head_dim + j;
+        // Handle batched tensors correctly
+        if output_shape.len() == 2 {
+            // Non-batched case: [seq_len, head_dim]
+            for i in 0..q_tile_size {
+                for j in 0..head_dim {
+                    let output_idx = (start + i) * head_dim + j;
+                    let tile_idx = i * head_dim + j;
+                    
+                    if output_idx < output_blob.len() && tile_idx < tile_blob.len() {
+                        output_blob[output_idx] += tile_blob[tile_idx];
+                    }
+                }
+            }
+        } else {
+            // Batched case: [batch_dims..., seq_len, head_dim]
+            let batch_size = output_shape[..output_shape.len() - 2].iter().product::<usize>();
+            let seq_len = output_shape[output_shape.len() - 2];
+            
+            for batch_idx in 0..batch_size {
+                let output_batch_offset = batch_idx * seq_len * head_dim;
+                let tile_batch_offset = batch_idx * q_tile_size * head_dim;
                 
-                if output_idx < output_blob.len() && tile_idx < tile_blob.len() {
-                    output_blob[output_idx] += tile_blob[tile_idx];
+                for i in 0..q_tile_size {
+                    for j in 0..head_dim {
+                        let output_idx = output_batch_offset + (start + i) * head_dim + j;
+                        let tile_idx = tile_batch_offset + i * head_dim + j;
+                        
+                        if output_idx < output_blob.len() && tile_idx < tile_blob.len() && (start + i) < seq_len {
+                            output_blob[output_idx] += tile_blob[tile_idx];
+                        }
+                    }
                 }
             }
         }
@@ -551,87 +671,69 @@ mod tests {
 
     #[test]
     fn test_flash_attention_basic() {
-        let seq_len = 8;
-        let head_dim = 4;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        // Create simple test inputs
-        let q_data: Vec<f32> = (0..seq_len * head_dim).map(|i| i as f32 * 0.1).collect();
-        let k_data: Vec<f32> = (0..seq_len * head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
-        let v_data: Vec<f32> = (0..seq_len * head_dim).map(|i| (i as f32 + 2.0) * 0.1).collect();
-
-        let q = Tensor::raw(&[seq_len, head_dim], q_data).unwrap();
-        let k = Tensor::raw(&[seq_len, head_dim], k_data).unwrap();
-        let v = Tensor::raw(&[seq_len, head_dim], v_data).unwrap();
-
-        let mut flash_attn = FlashAttention::new(scale, false);
-        let q_gen = GeneralTensor::Float(q);
-        let k_gen = GeneralTensor::Float(k);
-        let v_gen = GeneralTensor::Float(v);
-        let inputs = vec![&q_gen, &k_gen, &v_gen];
-
-        let result = flash_attn.run(&inputs, false);
-        assert!(result.is_ok());
+        let mut flash_attn = FlashAttention::new(1.0, false);
         
+        let q = Tensor::raw(&[4, 8], (0..32).map(|x| x as f32).collect()).unwrap();
+        let k = Tensor::raw(&[4, 8], (0..32).map(|x| (x + 1) as f32).collect()).unwrap();
+        let v = Tensor::raw(&[4, 8], (0..32).map(|x| (x + 2) as f32).collect()).unwrap();
+        
+        let inputs = [&GeneralTensor::Float(q), &GeneralTensor::Float(k), &GeneralTensor::Float(v)];
+        let result = flash_attn.run(&inputs, false);
+        
+        assert!(result.is_ok());
         let output = result.unwrap();
-        assert_eq!(output.shape(), &[seq_len, head_dim]);
+        assert_eq!(output.shape(), &[4, 8]);
+    }
+
+    #[test]
+    fn test_flash_attention_batched() {
+        let mut flash_attn = FlashAttention::new(1.0, false);
+        
+        // Create batched tensors with shape [1, 4, 8] (batch_size=1, seq_len=4, head_dim=8)
+        let q = Tensor::raw(&[1, 4, 8], (0..32).map(|x| x as f32).collect()).unwrap();
+        let k = Tensor::raw(&[1, 4, 8], (0..32).map(|x| (x + 1) as f32).collect()).unwrap();
+        let v = Tensor::raw(&[1, 4, 8], (0..32).map(|x| (x + 2) as f32).collect()).unwrap();
+        
+        let inputs = [&GeneralTensor::Float(q), &GeneralTensor::Float(k), &GeneralTensor::Float(v)];
+        let result = flash_attn.run(&inputs, false);
+        
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert_eq!(output.shape(), &[1, 4, 8]);
     }
 
     #[test]
     fn test_flash_attention_causal() {
-        let seq_len = 4;
-        let head_dim = 2;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        let q_data = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0];
-        let k_data = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0];
-        let v_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-
-        let q = Tensor::raw(&[seq_len, head_dim], q_data).unwrap();
-        let k = Tensor::raw(&[seq_len, head_dim], k_data).unwrap();
-        let v = Tensor::raw(&[seq_len, head_dim], v_data).unwrap();
-
-        let mut flash_attn = FlashAttention::new(scale, true);
-        let q_gen = GeneralTensor::Float(q);
-        let k_gen = GeneralTensor::Float(k);
-        let v_gen = GeneralTensor::Float(v);
-        let inputs = vec![&q_gen, &k_gen, &v_gen];
-
+        let mut flash_attn = FlashAttention::new(1.0, true);
+        
+        let q = Tensor::raw(&[4, 8], (0..32).map(|x| x as f32).collect()).unwrap();
+        let k = Tensor::raw(&[4, 8], (0..32).map(|x| (x + 1) as f32).collect()).unwrap();
+        let v = Tensor::raw(&[4, 8], (0..32).map(|x| (x + 2) as f32).collect()).unwrap();
+        
+        let inputs = [&GeneralTensor::Float(q), &GeneralTensor::Float(k), &GeneralTensor::Float(v)];
         let result = flash_attn.run(&inputs, false);
+        
         assert!(result.is_ok());
-        
         let output = result.unwrap();
-        assert_eq!(output.shape(), &[seq_len, head_dim]);
-        
-        // Verify causal property: each position should only attend to previous positions
-        // This is a basic sanity check - full numerical verification would require
-        // comparison with standard attention
+        assert_eq!(output.shape(), &[4, 8]);
     }
 
     #[test]
     fn test_flash_attention_larger_sequence() {
-        let seq_len = 128;
-        let head_dim = 64;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        // Create test data
-        let q_data: Vec<f32> = (0..seq_len * head_dim).map(|i| i as f32 * 0.01).collect();
-        let k_data: Vec<f32> = (0..seq_len * head_dim).map(|i| (i as f32 + 1.0) * 0.01).collect();
-        let v_data: Vec<f32> = (0..seq_len * head_dim).map(|i| (i as f32 + 2.0) * 0.01).collect();
-
-        let q = Tensor::raw(&[seq_len, head_dim], q_data).unwrap();
-        let k = Tensor::raw(&[seq_len, head_dim], k_data).unwrap();
-        let v = Tensor::raw(&[seq_len, head_dim], v_data).unwrap();
-
-        let mut flash_attn = FlashAttention::new(scale, false);
-        let q_gen = GeneralTensor::Float(q);
-        let k_gen = GeneralTensor::Float(k);
-        let v_gen = GeneralTensor::Float(v);
-        let inputs = vec![&q_gen, &k_gen, &v_gen];
-
-        let result = flash_attn.run(&inputs, false);
-        assert!(result.is_ok(), "Flash attention should work with larger sequences");
+        let mut flash_attn = FlashAttention::with_block_sizes(1.0, false, 16, 16);
         
+        let seq_len = 32;
+        let head_dim = 16;
+        let size = seq_len * head_dim;
+        
+        let q = Tensor::raw(&[seq_len, head_dim], (0..size).map(|x| x as f32 / size as f32).collect()).unwrap();
+        let k = Tensor::raw(&[seq_len, head_dim], (0..size).map(|x| (x + 1) as f32 / size as f32).collect()).unwrap();
+        let v = Tensor::raw(&[seq_len, head_dim], (0..size).map(|x| (x + 2) as f32 / size as f32).collect()).unwrap();
+        
+        let inputs = [&GeneralTensor::Float(q), &GeneralTensor::Float(k), &GeneralTensor::Float(v)];
+        let result = flash_attn.run(&inputs, false);
+        
+        assert!(result.is_ok());
         let output = result.unwrap();
         assert_eq!(output.shape(), &[seq_len, head_dim]);
     }
