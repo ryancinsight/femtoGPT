@@ -14,6 +14,25 @@ pub struct TrainingState {
     pub optimizer: OptimizerState,
 }
 
+/// Configuration for attention mechanism selection
+#[derive(Debug, Clone)]
+pub enum AttentionType {
+    /// Memory-efficient Flash Attention with configurable block sizes
+    Flash { block_size_q: usize, block_size_k: usize },
+    /// Standard attention implementation (O(N²) memory)
+    Standard,
+}
+
+impl Default for AttentionType {
+    fn default() -> Self {
+        // Default to Flash Attention with optimal block sizes
+        AttentionType::Flash { 
+            block_size_q: 64, 
+            block_size_k: 64 
+        }
+    }
+}
+
 pub struct GPT<G: Graph> {
     graph: G,
     num_tokens: usize,
@@ -23,6 +42,7 @@ pub struct GPT<G: Graph> {
     expected_output: TensorId,
     loss: TensorId,
     pos_input_fixed: Tensor<f32>,
+    attention_type: AttentionType,
 }
 
 fn sample_dataset<R: Rng>(
@@ -113,6 +133,27 @@ impl<G: Graph> GPT<G> {
         head_size: usize,
         dropout: f32,
     ) -> Result<Self, GraphError> {
+        Self::with_attention_type(
+            rng, g, batch_size, vocab_size, embedding_degree, 
+            num_tokens, num_layers, num_heads, head_size, dropout,
+            AttentionType::default()
+        )
+    }
+
+    /// Create GPT model with specific attention mechanism
+    pub fn with_attention_type<R: Rng>(
+        rng: &mut R,
+        mut g: G,
+        batch_size: Option<usize>,
+        vocab_size: usize,
+        embedding_degree: usize,
+        num_tokens: usize,
+        num_layers: usize,
+        num_heads: usize,
+        head_size: usize,
+        dropout: f32,
+        attention_type: AttentionType,
+    ) -> Result<Self, GraphError> {
         // Mapping each token to a `embedding_degree` dimension space through a lookup table
         let token_embedding = g.alloc(
             Tensor::<f32>::rand(rng, &[vocab_size, embedding_degree]),
@@ -177,9 +218,9 @@ impl<G: Graph> GPT<G> {
 
             let mut heads = Vec::new();
 
-            // Multi-head Attention
+            // Multi-head Attention using configurable attention mechanism
             for h in 0..num_heads {
-                // Key
+                // Key, Query, Value projections
                 let k_params = g.alloc(
                     Tensor::<f32>::rand(rng, &[embedding_degree, head_size]),
                     true,
@@ -187,7 +228,6 @@ impl<G: Graph> GPT<G> {
                 )?;
                 let k = g.call(MatMul::new(), &[norm_inp, k_params])?;
 
-                // Query
                 let q_params = g.alloc(
                     Tensor::<f32>::rand(rng, &[embedding_degree, head_size]),
                     true,
@@ -195,7 +235,6 @@ impl<G: Graph> GPT<G> {
                 )?;
                 let q = g.call(MatMul::new(), &[norm_inp, q_params])?;
 
-                // Value
                 let v_params = g.alloc(
                     Tensor::<f32>::rand(rng, &[embedding_degree, head_size]),
                     true,
@@ -203,16 +242,29 @@ impl<G: Graph> GPT<G> {
                 )?;
                 let v = g.call(MatMul::new(), &[norm_inp, v_params])?;
 
-                let q_t = g.call(Transpose::new(), &[q])?;
-                let kq = g.call(MatMul::new(), &[k, q_t])?;
-
-                let head_size_sqrt_inv = (head_size as f32).powf(-0.5);
-                let kq_coeff = g.call(Coeff::new(head_size_sqrt_inv), &[kq])?;
-
-                let masked_kq = g.call(TrilMask::new(num_tokens), &[kq_coeff])?;
-                let soft_masked_kq = g.call(Softmax::new(), &[masked_kq])?;
-                let dropped_soft_masked_kq = g.call(Dropout::new(dropout), &[soft_masked_kq])?;
-                let atten = g.call(MatMul::new(), &[dropped_soft_masked_kq, v])?;
+                // Apply attention mechanism based on configuration
+                let atten = match &attention_type {
+                    AttentionType::Flash { block_size_q, block_size_k } => {
+                        let scale = (head_size as f32).powf(-0.5);
+                        let flash_attn = FlashAttention::with_block_sizes(
+                            scale, 
+                            true, // causal masking for autoregressive generation
+                            *block_size_q, 
+                            *block_size_k
+                        );
+                        g.call(Box::new(flash_attn), &[q, k, v])?
+                    },
+                    AttentionType::Standard => {
+                        let std_attn = StandardAttention::new(
+                            1, // single head processed at a time
+                            head_size,
+                            true, // causal masking
+                            dropout
+                        );
+                        g.call(Box::new(std_attn), &[q, k, v])?
+                    }
+                };
+                
                 heads.push(atten);
             }
 
@@ -320,6 +372,7 @@ impl<G: Graph> GPT<G> {
             expected_output,
             loss,
             pos_input_fixed: pos_encode_inter(num_tokens, embedding_degree),
+            attention_type,
         })
     }
 
@@ -340,6 +393,11 @@ impl<G: Graph> GPT<G> {
             .into_iter()
             .map(|p| self.graph.get(p).unwrap().as_float().unwrap().size())
             .sum::<usize>()
+    }
+
+    /// Get the current attention mechanism type
+    pub fn attention_type(&self) -> &AttentionType {
+        &self.attention_type
     }
 
     pub fn set_training_state(
@@ -532,3 +590,5 @@ impl<G: Graph> GPT<G> {
         Ok(chs)
     }
 }
+
+
