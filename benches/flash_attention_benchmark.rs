@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use femto_gpt::funcs::{FlashAttention, Function, Softmax, Coeff, MatMul};
+use femto_gpt::funcs::{FlashAttention, Function, StandardAttention};
 use femto_gpt::tensor::{GeneralTensor, Tensor, TensorOps};
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
@@ -12,30 +12,22 @@ fn create_random_tensor(shape: &[usize], seed: u64) -> Tensor<f32> {
     Tensor::raw(shape, data).unwrap()
 }
 
-/// Compute standard attention for comparison
+/// Compute standard attention for comparison using StandardAttention function
 fn compute_standard_attention(
     q: &Tensor<f32>,
     k: &Tensor<f32>,
     v: &Tensor<f32>,
     scale: f32,
 ) -> Result<Tensor<f32>, femto_gpt::tensor::TensorError> {
-    // Q @ K^T
-    let k_t = k.transpose()?;
-    let mut matmul = MatMul::new();
-    let qk = matmul.run(&[&GeneralTensor::Float(q.clone()), &GeneralTensor::Float(k_t)], false)?;
-    let mut coeff = Coeff::new(scale);
-    let scores = coeff.run(&[&GeneralTensor::Float(qk)], false)?;
+    let head_dim = q.shape()[q.shape().len() - 1];
+    let mut std_attn = StandardAttention::with_scale(1, head_dim, false, 0.0, scale);
     
-    // Softmax
-    let mut softmax = Softmax::new();
-    let attention_weights = softmax.run(
-        &[&GeneralTensor::Float(scores)],
-        false
-    )?;
+    let q_gen = GeneralTensor::Float(q.clone());
+    let k_gen = GeneralTensor::Float(k.clone());
+    let v_gen = GeneralTensor::Float(v.clone());
+    let inputs = vec![&q_gen, &k_gen, &v_gen];
     
-    // Attention @ V
-    let mut matmul2 = MatMul::new();
-    matmul2.run(&[&GeneralTensor::Float(attention_weights), &GeneralTensor::Float(v.clone())], false)
+    std_attn.run(&inputs, false)
 }
 
 /// Benchmark Flash Attention vs Standard Attention across sequence lengths

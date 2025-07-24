@@ -19,6 +19,7 @@ mod layer_norm;
 mod matmul;
 mod relu;
 mod softmax;
+mod standard_attention;
 mod transpose;
 mod trilmask;
 
@@ -34,6 +35,7 @@ pub use layer_norm::*;
 pub use matmul::*;
 pub use relu::*;
 pub use softmax::*;
+pub use standard_attention::*;
 pub use transpose::*;
 pub use trilmask::*;
 
