@@ -175,11 +175,20 @@ Pipeline Stages:
 **Duration**: 2 weeks  
 **Effort**: 80 hours  
 
-**Epic 2.1: Flash Attention Implementation**
-- **Story 2.1.1**: Flash Attention core algorithm implementation
-- **Story 2.1.2**: CPU-optimized tiled attention computation
-- **Story 2.1.3**: GPU kernel optimization for Flash Attention
-- **Story 2.1.4**: Backward pass with selective recomputation
+**Epic 2.1: Flash Attention Implementation** ⚠️ PARTIALLY COMPLETED
+- **Story 2.1.1**: Flash Attention core algorithm implementation ✅ COMPLETED
+- **Story 2.1.2**: CPU-optimized tiled attention computation ✅ COMPLETED  
+- **Story 2.1.3**: GPU kernel optimization for Flash Attention ✅ COMPLETED
+- **Story 2.1.4**: Backward pass with selective recomputation ✅ COMPLETED
+- **Story 2.1.5**: GPT model integration ✅ COMPLETED
+- **Story 2.1.6**: Batched tensor support for Flash Attention ❌ **CRITICAL ISSUE IDENTIFIED**
+
+**Critical Issue Found**: Flash Attention has index out-of-bounds errors when processing batched tensors (shape `[batch, seq_len, head_dim]`) during training. The issue is in the tensor shape handling within the tiled computation functions. Standard Attention works correctly as fallback.
+
+**Immediate Action Required**: 
+- Fix batched tensor handling in Flash Attention's `extract_running_stats`, `update_running_stats`, and `accumulate_tile_output` functions
+- Ensure proper batch dimension preservation throughout the tiled computation pipeline
+- Comprehensive testing with various batch sizes and sequence lengths
 
 **Epic 2.2: Memory Optimization**
 - **Story 2.2.1**: Gradient checkpointing implementation  
