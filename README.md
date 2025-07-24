@@ -247,3 +247,29 @@ But the ball was too fast. Tim wanted to play with the ball. But the ball was to
 Tim tried to catch it, but it was too fast. Tim was sad. He tried to run away,
 but he did not want to play. Tim was sad. He did not want to play with the ball.
 ```
+
+## ⚠️ **CRITICAL ISSUE IDENTIFIED**
+
+**Problem**: Flash Attention and Standard Attention implementations have **stubbed gradient functions** that return zero gradients. This completely breaks backpropagation during training.
+
+**Impact**: 
+- Training will not work correctly as no gradients flow through attention layers
+- Model parameters won't update properly during learning
+- Index out-of-bounds errors in Flash Attention are masking this deeper issue
+
+**Status**: 
+- ✅ Flash/Standard attention integration completed
+- ❌ **CRITICAL**: Gradient computation is not implemented
+- ❌ Flash Attention has batching tensor issues  
+- ✅ Standard Attention works as fallback for forward pass
+
+**Next Steps**:
+1. Implement proper gradient computation for both attention mechanisms
+2. Fix Flash Attention batched tensor handling
+3. Comprehensive testing with gradient checking
+
+---
+
+femtoGPT uses minimal dependencies: random generation libraries (`rand`/`rand-distr`), data-serialization
+libraries (`serde`/`bincode` for saving/loading already trained models), a
+parallel computing library (`rayon`), and includes state-of-the-art optimizations like **Flash Attention** for memory-efficient training.

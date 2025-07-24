@@ -385,6 +385,27 @@
 
 ---
 
+### ❌ **CRITICAL ISSUE**: Task 2.1.7: Gradient Computation Implementation
+**Status**: **CRITICAL BLOCKER**  
+**RACI**: R=DEV, A=LEAD, C=QA, I=PM  
+**Effort**: 16 hours  
+**Dependencies**: Task 2.1.1 completion  
+**Due Date**: IMMEDIATE  
+
+**Problem Identified:**
+Both Flash Attention and Standard Attention have **stubbed gradient functions** returning zero gradients, completely breaking backpropagation during training.
+
+**Critical Requirements:**
+- [ ] Implement proper `grad()` function for Flash Attention with selective recomputation
+- [ ] Implement proper `grad()` function for Standard Attention with chain rule computation  
+- [ ] Gradient flow validation through attention layers
+- [ ] Numerical gradient checking for verification
+- [ ] Integration testing with actual training loop
+
+**Impact**: Without proper gradients, model training is completely non-functional.
+
+---
+
 ## Epic 2.2: Memory Optimization
 
 ### ⏳ Task 2.2.1: Gradient Checkpointing
@@ -457,6 +478,7 @@
 
 ### Current Progress
 - **Completed Tasks**: 4/13 (30.8%) [Phase 1] + 2/8 (25.0%) [Phase 2]
+- **Critical Blockers**: 1 (Gradient computation)
 - **In Progress Tasks**: 0/8 (0.0%) [Phase 2]  
 - **Pending Tasks**: 6/8 (75.0%) [Phase 2]
 
