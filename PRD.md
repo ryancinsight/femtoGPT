@@ -3,17 +3,17 @@
 ## 1. Executive Summary
 
 **Project**: femtoGPT - Minimal Rust GPT Implementation  
-**Version**: 0.3.0 (Target)  
-**Current Version**: 0.2.0  
-**Status**: Development - Testing Infrastructure Phase  
+**Version**: 0.4.0 (Target)  
+**Current Version**: 0.3.0  
+**Status**: Development - Performance Optimization Phase  
 **Owner**: Development Team  
 **Last Updated**: 2024-12-19  
 
 ### Vision
-Provide a production-ready, minimal Generative Pretrained Transformer implementation in pure Rust with comprehensive testing, documentation, and CI/CD pipeline.
+Provide a production-ready, minimal Generative Pretrained Transformer implementation in pure Rust with comprehensive testing, documentation, CI/CD pipeline, and state-of-the-art performance optimizations including Flash Attention.
 
 ### Mission
-Enable developers to understand, train, and deploy GPT-style language models with confidence through robust testing, clear documentation, and reliable infrastructure.
+Enable developers to understand, train, and deploy GPT-style language models with confidence through robust testing, clear documentation, reliable infrastructure, and memory-efficient attention mechanisms.
 
 ## 2. Problem Statement
 
@@ -93,6 +93,23 @@ Enable developers to understand, train, and deploy GPT-style language models wit
 - Performance optimization guide
 - Troubleshooting documentation
 
+#### FR-4: Flash Attention Implementation
+**Independent**: Standalone attention optimization module  
+**Negotiable**: Implementation approach (tiled vs online)  
+**Valuable**: Reduces memory usage by O(N²) to O(N), enables larger models  
+**Estimable**: ~32 hours development effort  
+**Small**: Deliverable in 1 sprint  
+**Testable**: Memory usage and performance benchmarks  
+
+**Acceptance Criteria:**
+- Memory-efficient attention computation avoiding O(N²) memory
+- Tiled computation with configurable block sizes
+- Backward pass optimization with recomputation
+- CPU and GPU implementations
+- Performance benchmarks showing 2-4x memory reduction
+- Numerical equivalence tests with standard attention
+- Integration with existing GPT architecture
+
 ### 4.2 Non-Functional Requirements
 
 #### NFR-1: Performance
@@ -149,33 +166,34 @@ Pipeline Stages:
 
 ## 6. Implementation Plan
 
-### Phase 1: Testing Infrastructure (Current Phase)
+### Phase 1: Testing Infrastructure (Completed)
+**Duration**: 2 weeks  
+**Effort**: 80 hours  
+**Status**: COMPLETED
+
+### Phase 2: Performance Optimization (Current Phase)
 **Duration**: 2 weeks  
 **Effort**: 80 hours  
 
-**Epic 1.1: Core Testing Framework**
-- **Story 1.1.1**: Set up test infrastructure and utilities
-- **Story 1.1.2**: Implement tensor operation unit tests
-- **Story 1.1.3**: Implement graph computation unit tests
-- **Story 1.1.4**: Implement GPT model unit tests
+**Epic 2.1: Flash Attention Implementation**
+- **Story 2.1.1**: Flash Attention core algorithm implementation
+- **Story 2.1.2**: CPU-optimized tiled attention computation
+- **Story 2.1.3**: GPU kernel optimization for Flash Attention
+- **Story 2.1.4**: Backward pass with selective recomputation
 
-**Epic 1.2: Integration Testing**
-- **Story 1.2.1**: Training workflow integration tests
-- **Story 1.2.2**: Inference workflow integration tests
-- **Story 1.2.3**: GPU/CPU compatibility tests
+**Epic 2.2: Memory Optimization**
+- **Story 2.2.1**: Gradient checkpointing implementation  
+- **Story 2.2.2**: Activation memory pooling
+- **Story 2.2.3**: Mixed precision training support
 
-**Epic 1.3: CI/CD Pipeline**
-- **Story 1.3.1**: GitHub Actions workflow setup
-- **Story 1.3.2**: Multi-platform testing configuration
-- **Story 1.3.3**: Performance benchmarking integration
+**Epic 2.3: Performance Benchmarking**
+- **Story 2.3.1**: Memory usage profiling tools
+- **Story 2.3.2**: Attention performance benchmarks
+- **Story 2.3.3**: End-to-end training speedup validation
 
-### Phase 2: Documentation Enhancement (Next Phase)
+### Phase 3: Documentation Enhancement (Next Phase)
 **Duration**: 1 week  
 **Effort**: 40 hours  
-
-### Phase 3: Performance Optimization (Future Phase)
-**Duration**: 2 weeks  
-**Effort**: 80 hours  
 
 ## 7. Risk Assessment
 

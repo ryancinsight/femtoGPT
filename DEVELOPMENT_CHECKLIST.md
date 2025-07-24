@@ -1,10 +1,10 @@
 # femtoGPT Development Checklist
 
-## Project Status: Phase 1 - Testing Infrastructure Implementation
+## Project Status: Phase 2 - Performance Optimization Implementation
 
-**Current Sprint**: Testing Foundation  
+**Current Sprint**: Flash Attention & Memory Optimization  
 **Sprint Duration**: 2024-12-19 to 2025-01-02 (2 weeks)  
-**Sprint Goal**: Establish comprehensive testing infrastructure with ≥95% coverage  
+**Sprint Goal**: Implement Flash Attention for memory-efficient transformer training  
 
 ---
 
@@ -309,37 +309,177 @@
 
 ---
 
+## Epic 2.1: Flash Attention Implementation
+
+### ⏳ Task 2.1.1: Flash Attention Core Algorithm
+**Status**: IN PROGRESS  
+**RACI**: R=DEV, A=LEAD, C=QA, I=PM  
+**Effort**: 12 hours  
+**Dependencies**: Phase 1 completion  
+**Due Date**: 2024-12-21  
+
+**Acceptance Criteria:**
+- [ ] FlashAttention struct with configurable block sizes
+- [ ] Tiled computation avoiding O(N²) memory materialization  
+- [ ] Online softmax computation with running statistics
+- [ ] Numerical equivalence with standard attention (tolerance 1e-5)
+- [ ] CPU implementation optimized for cache efficiency
+- [ ] Integration with existing Function trait
+
+**Technical Requirements:**
+- Block size: 64x64 for optimal cache usage
+- Support for arbitrary sequence lengths
+- Causal masking integration
+- Temperature scaling support
+
+---
+
+### ⏳ Task 2.1.2: CPU-Optimized Tiled Computation
+**Status**: PENDING  
+**RACI**: R=DEV, A=LEAD, C=QA, I=PM  
+**Effort**: 10 hours  
+**Dependencies**: Task 2.1.1  
+**Due Date**: 2024-12-22  
+
+**Acceptance Criteria:**
+- [ ] SIMD-optimized matrix operations for tiles
+- [ ] Cache-friendly memory access patterns
+- [ ] Parallel computation across attention heads
+- [ ] Memory usage ≤50% of standard attention
+- [ ] Performance within 10% of standard attention
+
+---
+
+### ⏳ Task 2.1.3: GPU Flash Attention Integration  
+**Status**: PENDING  
+**RACI**: R=DEV, A=LEAD, C=QA, I=PM  
+**Effort**: 8 hours  
+**Dependencies**: Task 2.1.2  
+**Due Date**: 2024-12-23  
+
+**Acceptance Criteria:**
+- [ ] OpenCL kernel for tiled attention computation
+- [ ] Shared memory optimization for GPU blocks
+- [ ] Coalesced memory access patterns
+- [ ] GPU memory usage reduction ≥60%
+- [ ] Performance improvement ≥2x for large sequences
+
+---
+
+### ⏳ Task 2.1.4: Backward Pass Optimization
+**Status**: PENDING  
+**RACI**: R=DEV, A=LEAD, C=QA, I=PM  
+**Effort**: 10 hours  
+**Dependencies**: Task 2.1.3  
+**Due Date**: 2024-12-24  
+
+**Acceptance Criteria:**
+- [ ] Selective recomputation for gradient calculation
+- [ ] Memory-efficient gradient accumulation
+- [ ] Numerical gradient verification (tolerance 1e-4)
+- [ ] Integration with existing backward pass system
+- [ ] Training convergence equivalence validation
+
+---
+
+## Epic 2.2: Memory Optimization
+
+### ⏳ Task 2.2.1: Gradient Checkpointing
+**Status**: PENDING  
+**RACI**: R=DEV, A=LEAD, C=QA, I=PM  
+**Effort**: 8 hours  
+**Dependencies**: Task 2.1.4  
+**Due Date**: 2024-12-26  
+
+**Acceptance Criteria:**
+- [ ] Configurable checkpointing intervals
+- [ ] Automatic recomputation during backward pass
+- [ ] Memory usage reduction ≥40% for large models
+- [ ] Training time increase ≤20%
+- [ ] Integration with Graph trait
+
+---
+
+### ⏳ Task 2.2.2: Memory Pool Management
+**Status**: PENDING  
+**RACI**: R=DEV, A=LEAD, C=QA, I=PM  
+**Effort**: 6 hours  
+**Dependencies**: Task 2.2.1  
+**Due Date**: 2024-12-27  
+
+**Acceptance Criteria:**
+- [ ] Pre-allocated tensor memory pools
+- [ ] Automatic memory reuse for intermediate tensors
+- [ ] Fragmentation reduction strategies
+- [ ] Memory leak prevention and detection
+- [ ] Peak memory usage reduction ≥25%
+
+---
+
+## Epic 2.3: Performance Benchmarking & Validation
+
+### ⏳ Task 2.3.1: Flash Attention Benchmarks
+**Status**: PENDING  
+**RACI**: R=DEV, A=LEAD, C=QA, I=PM  
+**Effort**: 6 hours  
+**Dependencies**: Task 2.1.4  
+**Due Date**: 2024-12-28  
+
+**Acceptance Criteria:**
+- [ ] Memory usage comparison benchmarks
+- [ ] Execution time comparison across sequence lengths
+- [ ] Numerical accuracy validation tests
+- [ ] Performance regression detection
+- [ ] Benchmark integration with CI/CD
+
+---
+
+### ⏳ Task 2.3.2: End-to-End Training Validation
+**Status**: PENDING  
+**RACI**: R=DEV, A=LEAD, C=QA, I=PM  
+**Effort**: 8 hours  
+**Dependencies**: Task 2.3.1  
+**Due Date**: 2024-12-30  
+
+**Acceptance Criteria:**
+- [ ] Training convergence equivalence (±2% loss)
+- [ ] Model quality validation on test dataset
+- [ ] Memory usage profiling during training
+- [ ] Performance improvement documentation
+- [ ] Integration test with existing GPT architecture
+
+---
+
 ## Sprint Metrics
 
 ### Current Progress
-- **Completed Tasks**: 4/13 (30.8%)
-- **In Progress Tasks**: 0/13 (0.0%)
-- **Pending Tasks**: 9/13 (69.2%)
+- **Completed Tasks**: 4/13 (30.8%) [Phase 1]
+- **In Progress Tasks**: 1/8 (12.5%) [Phase 2]  
+- **Pending Tasks**: 7/8 (87.5%) [Phase 2]
 
 ### Velocity Tracking
-- **Planned Effort**: 108 hours
-- **Completed Effort**: 38 hours
-- **Remaining Effort**: 70 hours
-- **Daily Velocity Target**: 5.0 hours/day
+- **Phase 1 Completed Effort**: 38 hours
+- **Phase 2 Planned Effort**: 68 hours
+- **Phase 2 Completed Effort**: 0 hours
+- **Daily Velocity Target**: 4.9 hours/day
 
 ### Quality Metrics
-- **Current Test Coverage**: ~85% (comprehensive test suite implemented)
-- **Target Test Coverage**: 95%
-- **Current Build Success**: 100%
-- **Performance Baseline**: Established with criterion benchmarks
+- **Current Test Coverage**: ~85% (Phase 1 baseline)
+- **Target Test Coverage**: 95% (including Flash Attention)
+- **Memory Efficiency Target**: 50% reduction vs standard attention
+- **Performance Target**: Within 10% of standard attention speed
 
 ---
 
 ## Next Sprint Planning
 
-### Potential Sprint 2 Scope (Documentation Enhancement)
-- API documentation generation
-- Architecture decision records
-- Contributing guidelines
+### Potential Sprint 3 Scope (Documentation & CI/CD)
+- Flash Attention architecture documentation
 - Performance optimization guide
-- User documentation updates
+- CI/CD pipeline with performance regression detection
+- GPU testing infrastructure setup
 
-**Estimated Effort**: 40 hours  
+**Estimated Effort**: 48 hours  
 **Duration**: 1 week  
 
 ---

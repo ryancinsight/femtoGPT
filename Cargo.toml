@@ -34,3 +34,7 @@ harness = false
 [[bench]]
 name = "training_benchmark"
 harness = false
+
+[[bench]]
+name = "flash_attention_benchmark"
+harness = false
