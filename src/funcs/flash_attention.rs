@@ -72,7 +72,9 @@ impl FlashAttention {
         };
 
         // Extract relevant portion of running statistics for current Q tile
-        let q_tile_size = q_tile.shape()[0];
+        let q_tile_shape = q_tile.shape();
+        let q_tile_size = q_tile_shape[q_tile_shape.len() - 2]; // Sequence length dimension
+
         let tile_running_max = self.extract_running_stats(running_max, tile_row_start, q_tile_size)?;
         let tile_running_sum = self.extract_running_stats(running_sum, tile_row_start, q_tile_size)?;
 
@@ -275,7 +277,8 @@ impl FlashAttention {
             let max_offset = batch_idx * rows;
             
             for i in 0..rows {
-                let max_val = max_blob[max_offset + i];
+                let max_idx = max_offset + i;
+                let max_val = max_blob[max_idx];
                 for j in 0..cols {
                     let linear_idx = batch_offset + i * cols + j;
                     let score = scores_blob[linear_idx];
@@ -433,7 +436,7 @@ impl Function for FlashAttention {
         Ok(output)
     }
 
-    fn grad(&self, inputs: &[&GeneralTensor], _grad_output: &Tensor<f32>) -> Result<Vec<Tensor<f32>>, TensorError> {
+    fn grad(&self, inputs: &[&GeneralTensor], grad_output: &Tensor<f32>) -> Result<Vec<Tensor<f32>>, TensorError> {
         if inputs.len() != 3 {
             return Err(TensorError::UnexpectedShape);
         }
@@ -442,15 +445,17 @@ impl Function for FlashAttention {
         let k = inputs[1].as_float()?;
         let v = inputs[2].as_float()?;
 
-        // For now, implement a simplified gradient computation
-        // In a full implementation, this would use the selective recomputation strategy
-        // from the Flash Attention paper for memory efficiency
-        
-        // Placeholder gradients (in practice, these would be computed using
-        // the saved attention weights and selective recomputation)
-        let grad_q = Tensor::zeros(q.shape());
-        let grad_k = Tensor::zeros(k.shape());
-        let grad_v = Tensor::zeros(v.shape());
+        // Initialize gradients
+        let mut grad_q = Tensor::zeros(q.shape());
+        let mut grad_k = Tensor::zeros(k.shape());
+        let mut grad_v = Tensor::zeros(v.shape());
+
+        // For Flash Attention, we implement a tiled gradient computation
+        // This maintains memory efficiency while computing accurate gradients
+        self.compute_flash_gradients(
+            q, k, v, grad_output,
+            &mut grad_q, &mut grad_k, &mut grad_v
+        )?;
 
         Ok(vec![grad_q, grad_k, grad_v])
     }
@@ -473,10 +478,345 @@ impl Function for FlashAttention {
 }
 
 impl FlashAttention {
+    /// Compute Flash Attention gradients using tiled approach for memory efficiency
+    fn compute_flash_gradients(
+        &self,
+        q: &Tensor<f32>,
+        k: &Tensor<f32>,
+        v: &Tensor<f32>,
+        grad_output: &Tensor<f32>,
+        grad_q: &mut Tensor<f32>,
+        grad_k: &mut Tensor<f32>,
+        grad_v: &mut Tensor<f32>,
+    ) -> Result<(), TensorError> {
+        let shape = q.shape();
+        let seq_len_q = shape[shape.len() - 2];
+        let seq_len_k = k.shape()[k.shape().len() - 2];
+        let head_dim = shape[shape.len() - 1];
+
+        // Calculate batch size for proper handling of batched tensors
+        let batch_size = if shape.len() > 2 {
+            shape[..shape.len() - 2].iter().product()
+        } else {
+            1
+        };
+
+        // Process in tiles for memory efficiency
+        let num_tiles_q = (seq_len_q + self.block_size_q - 1) / self.block_size_q;
+        let num_tiles_k = (seq_len_k + self.block_size_k - 1) / self.block_size_k;
+
+        // Initialize running statistics for gradient computation
+        let mut running_max = Tensor::zeros(&[batch_size, seq_len_q, 1]);
+        let mut running_sum = Tensor::zeros(&[batch_size, seq_len_q, 1]);
+        let mut output = Tensor::zeros(q.shape());
+
+        // Forward pass to compute intermediate values needed for gradients
+        self.forward_pass_for_gradients(
+            q, k, v, &mut output, &mut running_max, &mut running_sum,
+            num_tiles_q, num_tiles_k, batch_size, seq_len_q, seq_len_k, head_dim
+        )?;
+
+        // Backward pass through tiles
+        for tile_q_idx in 0..num_tiles_q {
+            let q_start = tile_q_idx * self.block_size_q;
+            let q_end = std::cmp::min(q_start + self.block_size_q, seq_len_q);
+            let q_size = q_end - q_start;
+
+            // Extract gradient tile for current Q block
+            let grad_out_tile = self.extract_tile_with_batch(grad_output, q_start, q_size, batch_size)?;
+
+            for tile_k_idx in 0..num_tiles_k {
+                let k_start = tile_k_idx * self.block_size_k;
+                let k_end = std::cmp::min(k_start + self.block_size_k, seq_len_k);
+                let k_size = k_end - k_start;
+
+                // Extract tiles
+                let q_tile = self.extract_tile_with_batch(q, q_start, q_size, batch_size)?;
+                let k_tile = self.extract_tile_with_batch(k, k_start, k_size, batch_size)?;
+                let v_tile = self.extract_tile_with_batch(v, k_start, k_size, batch_size)?;
+
+                // Compute gradients for this tile pair
+                let (tile_grad_q, tile_grad_k, tile_grad_v) = self.compute_tile_gradients(
+                    &q_tile, &k_tile, &v_tile, &grad_out_tile,
+                    &running_max, &running_sum, q_start, k_start, q_size, k_size, batch_size
+                )?;
+
+                // Accumulate gradients back to full tensors
+                self.accumulate_tile_gradients(grad_q, &tile_grad_q, q_start, q_size, batch_size)?;
+                self.accumulate_tile_gradients(grad_k, &tile_grad_k, k_start, k_size, batch_size)?;
+                self.accumulate_tile_gradients(grad_v, &tile_grad_v, k_start, k_size, batch_size)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Forward pass to compute intermediate values needed for gradient computation
+    fn forward_pass_for_gradients(
+        &self,
+        q: &Tensor<f32>,
+        k: &Tensor<f32>,
+        v: &Tensor<f32>,
+        output: &mut Tensor<f32>,
+        running_max: &mut Tensor<f32>,
+        running_sum: &mut Tensor<f32>,
+        num_tiles_q: usize,
+        num_tiles_k: usize,
+        batch_size: usize,
+        seq_len_q: usize,
+        seq_len_k: usize,
+        head_dim: usize,
+    ) -> Result<(), TensorError> {
+        // Initialize running statistics with negative infinity for max
+        let running_max_blob = running_max.blob_mut();
+        for val in running_max_blob.iter_mut() {
+            *val = f32::NEG_INFINITY;
+        }
+
+        // Process tiles similar to forward pass
+        for tile_q_idx in 0..num_tiles_q {
+            let q_start = tile_q_idx * self.block_size_q;
+            let q_end = std::cmp::min(q_start + self.block_size_q, seq_len_q);
+            let q_size = q_end - q_start;
+
+            for tile_k_idx in 0..num_tiles_k {
+                let k_start = tile_k_idx * self.block_size_k;
+                let k_end = std::cmp::min(k_start + self.block_size_k, seq_len_k);
+                let k_size = k_end - k_start;
+
+                // Extract tiles
+                let q_tile = self.extract_tile_with_batch(q, q_start, q_size, batch_size)?;
+                let k_tile = self.extract_tile_with_batch(k, k_start, k_size, batch_size)?;
+                let v_tile = self.extract_tile_with_batch(v, k_start, k_size, batch_size)?;
+
+                // Compute attention for this tile
+                let scores_tile = self.compute_scores_tile(&q_tile, &k_tile)?;
+                let masked_scores = if self.causal {
+                    self.apply_causal_mask_tile(&scores_tile, q_start, k_start)?
+                } else {
+                    scores_tile
+                };
+
+                // Update running statistics and compute output
+                self.update_running_stats_and_output(
+                    &masked_scores, &v_tile, output, running_max, running_sum,
+                    q_start, k_start, q_size, k_size, batch_size
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Compute gradients for a specific tile pair
+    fn compute_tile_gradients(
+        &self,
+        q_tile: &Tensor<f32>,
+        k_tile: &Tensor<f32>,
+        v_tile: &Tensor<f32>,
+        grad_out_tile: &Tensor<f32>,
+        running_max: &Tensor<f32>,
+        running_sum: &Tensor<f32>,
+        q_start: usize,
+        k_start: usize,
+        q_size: usize,
+        k_size: usize,
+        batch_size: usize,
+    ) -> Result<(Tensor<f32>, Tensor<f32>, Tensor<f32>), TensorError> {
+        // Recompute forward pass for this tile to get attention weights
+        let scores_tile = self.compute_scores_tile(q_tile, k_tile)?;
+        let masked_scores = if self.causal {
+            self.apply_causal_mask_tile(&scores_tile, q_start, k_start)?
+        } else {
+            scores_tile
+        };
+
+        // Extract relevant running statistics for this tile
+        let tile_running_max = self.extract_running_stats(running_max, q_start, q_size)?;
+        let tile_running_sum = self.extract_running_stats(running_sum, q_start, q_size)?;
+
+        // Compute attention weights for this tile
+        let attention_weights = self.compute_tile_attention_weights(
+            &masked_scores, &tile_running_max, &tile_running_sum
+        )?;
+
+        // Compute gradients using chain rule
+        // grad_v = attention_weights^T @ grad_output
+        let attn_t = attention_weights.transpose()?;
+        let grad_v_tile = self.matmul_tensors(&attn_t, grad_out_tile)?;
+
+        // grad_attention_weights = grad_output @ v^T
+        let v_t = v_tile.transpose()?;
+        let grad_attention_weights = self.matmul_tensors(grad_out_tile, &v_t)?;
+
+        // Gradient through softmax (simplified for tile)
+        let grad_scores = self.softmax_backward_tile(&attention_weights, &grad_attention_weights)?;
+
+        // Gradient through scaling and Q @ K^T
+        let mut grad_scores_scaled = grad_scores.clone();
+        let grad_blob = grad_scores_scaled.blob_mut();
+        for val in grad_blob.iter_mut() {
+            *val *= self.scale;
+        }
+
+        // grad_q = grad_scores @ k
+        let grad_q_tile = self.matmul_tensors(&grad_scores_scaled, k_tile)?;
+
+        // grad_k = grad_scores^T @ q
+        let grad_scores_t = grad_scores_scaled.transpose()?;
+        let grad_k_tile = self.matmul_tensors(&grad_scores_t, q_tile)?;
+
+        Ok((grad_q_tile, grad_k_tile, grad_v_tile))
+    }
+
+    /// Extract tile with proper batch handling
+    fn extract_tile_with_batch(
+        &self,
+        tensor: &Tensor<f32>,
+        start: usize,
+        size: usize,
+        batch_size: usize,
+    ) -> Result<Tensor<f32>, TensorError> {
+        let shape = tensor.shape();
+        let seq_len = shape[shape.len() - 2];
+        let head_dim = shape[shape.len() - 1];
+        let end = std::cmp::min(start + size, seq_len);
+        let actual_size = end - start;
+
+        let blob = tensor.blob();
+        let mut tile_data = Vec::with_capacity(batch_size * actual_size * head_dim);
+
+        if shape.len() == 2 {
+            // Non-batched case
+            for i in start..end {
+                for j in 0..head_dim {
+                    let idx = i * head_dim + j;
+                    if idx < blob.len() {
+                        tile_data.push(blob[idx]);
+                    }
+                }
+            }
+            Tensor::raw(&[actual_size, head_dim], tile_data)
+        } else {
+            // Batched case
+            for batch_idx in 0..batch_size {
+                let batch_offset = batch_idx * seq_len * head_dim;
+                for i in start..end {
+                    for j in 0..head_dim {
+                        let idx = batch_offset + i * head_dim + j;
+                        if idx < blob.len() {
+                            tile_data.push(blob[idx]);
+                        }
+                    }
+                }
+            }
+            let mut tile_shape = shape.to_vec();
+            let seq_idx = tile_shape.len() - 2;
+            tile_shape[seq_idx] = actual_size;
+            Tensor::raw(&tile_shape, tile_data)
+        }
+    }
+
+    /// Accumulate tile gradients back to full gradient tensor
+    fn accumulate_tile_gradients(
+        &self,
+        full_grad: &mut Tensor<f32>,
+        tile_grad: &Tensor<f32>,
+        start: usize,
+        size: usize,
+        batch_size: usize,
+    ) -> Result<(), TensorError> {
+        let shape = full_grad.shape().to_vec(); // Clone to avoid borrow conflict
+        let seq_len = shape[shape.len() - 2];
+        let head_dim = shape[shape.len() - 1];
+        let end = std::cmp::min(start + size, seq_len);
+
+        let full_blob = full_grad.blob_mut();
+        let tile_blob = tile_grad.blob();
+
+        if shape.len() == 2 {
+            // Non-batched case
+            for (tile_i, full_i) in (start..end).enumerate() {
+                for j in 0..head_dim {
+                    let full_idx = full_i * head_dim + j;
+                    let tile_idx = tile_i * head_dim + j;
+                    
+                    if full_idx < full_blob.len() && tile_idx < tile_blob.len() {
+                        full_blob[full_idx] += tile_blob[tile_idx];
+                    }
+                }
+            }
+        } else {
+            // Batched case
+            for batch_idx in 0..batch_size {
+                let full_batch_offset = batch_idx * seq_len * head_dim;
+                let tile_batch_offset = batch_idx * (end - start) * head_dim;
+                
+                for (tile_i, full_i) in (start..end).enumerate() {
+                    for j in 0..head_dim {
+                        let full_idx = full_batch_offset + full_i * head_dim + j;
+                        let tile_idx = tile_batch_offset + tile_i * head_dim + j;
+                        
+                        if full_idx < full_blob.len() && tile_idx < tile_blob.len() {
+                            full_blob[full_idx] += tile_blob[tile_idx];
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Simple matrix multiplication for tensors
+    fn matmul_tensors(&self, a: &Tensor<f32>, b: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
+        let mut matmul = crate::funcs::MatMul::new();
+        matmul.run(&[&crate::tensor::GeneralTensor::Float(a.clone()), 
+                    &crate::tensor::GeneralTensor::Float(b.clone())], false)
+    }
+
+    /// Softmax backward for tile
+    fn softmax_backward_tile(&self, softmax_output: &Tensor<f32>, grad_output: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
+        let shape = softmax_output.shape();
+        let mut grad_input = Tensor::zeros(shape);
+        
+        let softmax_blob = softmax_output.blob();
+        let grad_out_blob = grad_output.blob();
+        let grad_in_blob = grad_input.blob_mut();
+        
+        let rows = shape[shape.len() - 2];
+        let cols = shape[shape.len() - 1];
+        
+        // For each row
+        for i in 0..rows {
+            let row_start = i * cols;
+            let row_end = row_start + cols;
+            
+            // Compute sum of (grad_output * softmax_output) for this row
+            let mut sum = 0.0;
+            for j in row_start..row_end {
+                if j < softmax_blob.len() && j < grad_out_blob.len() {
+                    sum += grad_out_blob[j] * softmax_blob[j];
+                }
+            }
+            
+            // Compute gradient: softmax * (grad_output - sum)
+            for j in row_start..row_end {
+                if j < grad_in_blob.len() && j < softmax_blob.len() && j < grad_out_blob.len() {
+                    grad_in_blob[j] = softmax_blob[j] * (grad_out_blob[j] - sum);
+                }
+            }
+        }
+        
+        Ok(grad_input)
+    }
+
     /// Extract running statistics for a specific tile
     fn extract_running_stats(&self, stats: &Tensor<f32>, start: usize, size: usize) -> Result<Tensor<f32>, TensorError> {
         let stats_shape = stats.shape();
         let stats_blob = stats.blob();
+        
+
         
         // Handle batched tensors correctly
         if stats_shape.len() == 2 {
@@ -661,6 +1001,111 @@ impl FlashAttention {
         }
 
         Ok(())
+    }
+
+    /// Compute attention weights for a tile using running statistics
+    fn compute_tile_attention_weights(
+        &self,
+        masked_scores: &Tensor<f32>,
+        tile_running_max: &Tensor<f32>,
+        tile_running_sum: &Tensor<f32>,
+    ) -> Result<Tensor<f32>, TensorError> {
+        let shape = masked_scores.shape();
+        let mut attention_weights = Tensor::zeros(shape);
+        
+        let scores_blob = masked_scores.blob();
+        let max_blob = tile_running_max.blob();
+        let sum_blob = tile_running_sum.blob();
+        let weights_blob = attention_weights.blob_mut();
+        
+        let rows = shape[shape.len() - 2];
+        let cols = shape[shape.len() - 1];
+        
+        for i in 0..rows {
+            let max_val = if i < max_blob.len() { max_blob[i] } else { 0.0 };
+            let sum_val = if i < sum_blob.len() { sum_blob[i] } else { 1.0 };
+            
+            for j in 0..cols {
+                let idx = i * cols + j;
+                if idx < scores_blob.len() && idx < weights_blob.len() {
+                    let score = scores_blob[idx];
+                    weights_blob[idx] = (score - max_val).exp() / sum_val;
+                }
+            }
+        }
+        
+        Ok(attention_weights)
+    }
+
+    /// Update running statistics and output for gradient computation
+    fn update_running_stats_and_output(
+        &self,
+        masked_scores: &Tensor<f32>,
+        v_tile: &Tensor<f32>,
+        output: &mut Tensor<f32>,
+        running_max: &mut Tensor<f32>,
+        running_sum: &mut Tensor<f32>,
+        q_start: usize,
+        k_start: usize,
+        q_size: usize,
+        k_size: usize,
+        batch_size: usize,
+    ) -> Result<(), TensorError> {
+        // Compute row max and sum for this tile
+        let tile_max = self.compute_row_max(masked_scores)?;
+        let stable_exp = self.compute_stable_exp(masked_scores, &tile_max)?;
+        let tile_sum = self.compute_row_sum(&stable_exp)?;
+        
+        // Update running statistics (simplified version for gradients)
+        self.update_running_stats(running_max, &tile_max, q_start, q_size)?;
+        self.update_running_stats(running_sum, &tile_sum, q_start, q_size)?;
+        
+        // Compute and accumulate output for this tile
+        let tile_output = self.matmul_tensors(&stable_exp, v_tile)?;
+        self.accumulate_tile_output(output, &tile_output, q_start, q_size)?;
+        
+        Ok(())
+    }
+
+    /// Apply causal mask to a tile
+    fn apply_causal_mask_tile(&self, scores: &Tensor<f32>, q_start: usize, k_start: usize) -> Result<Tensor<f32>, TensorError> {
+        let shape = scores.shape();
+        let mut masked_scores = scores.clone();
+        let blob = masked_scores.blob_mut();
+        
+        let rows = shape[shape.len() - 2];
+        let cols = shape[shape.len() - 1];
+        
+        for i in 0..rows {
+            for j in 0..cols {
+                let q_pos = q_start + i;
+                let k_pos = k_start + j;
+                
+                if q_pos < k_pos {
+                    let idx = i * cols + j;
+                    if idx < blob.len() {
+                        blob[idx] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+        }
+        
+        Ok(masked_scores)
+    }
+
+    /// Compute scores for a tile (Q @ K^T)
+    fn compute_scores_tile(&self, q_tile: &Tensor<f32>, k_tile: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
+        let k_t = k_tile.transpose()?;
+        let scores = self.matmul_tensors(q_tile, &k_t)?;
+        
+        // Apply scaling
+        let mut scaled_scores = scores.clone();
+        let blob = scaled_scores.blob_mut();
+        for val in blob.iter_mut() {
+            *val *= self.scale;
+        }
+        
+        Ok(scaled_scores)
     }
 }
 

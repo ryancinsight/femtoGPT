@@ -25,9 +25,10 @@ pub enum AttentionType {
 
 impl Default for AttentionType {
     fn default() -> Self {
-        // Temporarily use Standard attention while debugging Flash Attention
-        AttentionType::Standard
-        // AttentionType::Flash { block_size_q: 64, block_size_k: 64 }
+        AttentionType::Flash { 
+            block_size_q: 32, 
+            block_size_k: 32 
+        }
     }
 }
 

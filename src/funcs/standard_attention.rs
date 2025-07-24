@@ -1,5 +1,5 @@
 use crate::funcs::{Function, MatMul, Coeff, Softmax, TrilMask, Dropout};
-use crate::tensor::{GeneralTensor, Tensor, TensorError, TensorOps};
+use crate::tensor::{GeneralTensor, Tensor, TensorError, TensorOps, TensorMutOps};
 
 /// Standard Multi-Head Attention implementation
 /// 
@@ -147,7 +147,7 @@ impl Function for StandardAttention {
         self.concat_heads(&head_outputs)
     }
 
-    fn grad(&self, inputs: &[&GeneralTensor], _grad_output: &Tensor<f32>) -> Result<Vec<Tensor<f32>>, TensorError> {
+    fn grad(&self, inputs: &[&GeneralTensor], grad_output: &Tensor<f32>) -> Result<Vec<Tensor<f32>>, TensorError> {
         if inputs.len() != 3 {
             return Err(TensorError::UnexpectedShape);
         }
@@ -156,11 +156,40 @@ impl Function for StandardAttention {
         let k = inputs[1].as_float()?;
         let v = inputs[2].as_float()?;
 
-        // Placeholder gradients - in practice, these would be computed using
-        // the chain rule through all the attention operations
-        let grad_q = Tensor::zeros(q.shape());
-        let grad_k = Tensor::zeros(k.shape());
-        let grad_v = Tensor::zeros(v.shape());
+        // Validate input dimensions
+        let q_shape = q.shape();
+        let seq_len = q_shape[q_shape.len() - 2];
+        let embed_dim = q_shape[q_shape.len() - 1];
+        let actual_head_dim = embed_dim / self.num_heads;
+
+        // Initialize gradients
+        let mut grad_q = Tensor::zeros(q.shape());
+        let mut grad_k = Tensor::zeros(k.shape());
+        let mut grad_v = Tensor::zeros(v.shape());
+
+        // Compute gradients for each head
+        for head_idx in 0..self.num_heads {
+            let head_start = head_idx * self.head_dim;
+            let head_end = head_start + self.head_dim;
+            
+            // Extract head-specific tensors
+            let q_head = self.extract_head(q, head_start, head_end)?;
+            let k_head = self.extract_head(k, head_start, head_end)?;
+            let v_head = self.extract_head(v, head_start, head_end)?;
+            
+            // Extract head-specific gradient
+            let grad_out_head = self.extract_head_grad(grad_output, head_idx, actual_head_dim)?;
+            
+            // Compute head gradients
+            let (head_grad_q, head_grad_k, head_grad_v) = self.compute_head_gradients(
+                &q_head, &k_head, &v_head, &grad_out_head, seq_len
+            )?;
+            
+            // Accumulate gradients back to full tensors
+            self.accumulate_head_gradients(&mut grad_q, &head_grad_q, head_start, head_end)?;
+            self.accumulate_head_gradients(&mut grad_k, &head_grad_k, head_start, head_end)?;
+            self.accumulate_head_gradients(&mut grad_v, &head_grad_v, head_start, head_end)?;
+        }
 
         Ok(vec![grad_q, grad_k, grad_v])
     }
@@ -227,6 +256,158 @@ impl StandardAttention {
         }
         
         Tensor::raw(&[seq_len, total_dim], concat_data)
+    }
+
+    /// Extract head-specific gradient from output gradient
+    fn extract_head_grad(&self, grad_output: &Tensor<f32>, head_idx: usize, head_dim: usize) -> Result<Tensor<f32>, TensorError> {
+        let shape = grad_output.shape();
+        let seq_len = shape[shape.len() - 2];
+        let embed_dim = shape[shape.len() - 1];
+        
+        let head_start = head_idx * head_dim;
+        let head_end = head_start + head_dim;
+        
+        let mut head_grad_data = Vec::with_capacity(seq_len * head_dim);
+        let blob = grad_output.blob();
+        
+        for i in 0..seq_len {
+            for j in head_start..head_end {
+                let idx = i * embed_dim + j;
+                if idx < blob.len() {
+                    head_grad_data.push(blob[idx]);
+                }
+            }
+        }
+        
+        let mut head_shape = shape.to_vec();
+        let last_idx = head_shape.len() - 1;
+        head_shape[last_idx] = head_dim;
+        
+        Tensor::raw(&head_shape, head_grad_data)
+    }
+
+    /// Compute gradients for a single attention head using chain rule
+    fn compute_head_gradients(
+        &self,
+        q_head: &Tensor<f32>,
+        k_head: &Tensor<f32>,
+        v_head: &Tensor<f32>,
+        grad_output: &Tensor<f32>,
+        seq_len: usize,
+    ) -> Result<(Tensor<f32>, Tensor<f32>, Tensor<f32>), TensorError> {
+        // Forward pass to get intermediate values needed for gradients
+        let mut matmul1 = MatMul::new();
+        let q_t = q_head.transpose()?;
+        let qk = matmul1.run(&[&GeneralTensor::Float(k_head.clone()), &GeneralTensor::Float(q_t)], false)?;
+
+        let mut coeff = Coeff::new(self.scale);
+        let scaled_qk = coeff.run(&[&GeneralTensor::Float(qk)], false)?;
+
+        let masked_qk = if self.causal {
+            let mut tril_mask = TrilMask::new(seq_len);
+            tril_mask.run(&[&GeneralTensor::Float(scaled_qk)], false)?
+        } else {
+            scaled_qk
+        };
+
+        let mut softmax = Softmax::new();
+        let attention_weights = softmax.run(&[&GeneralTensor::Float(masked_qk)], false)?;
+
+        // Gradient computation using chain rule
+        // grad_v = attention_weights^T @ grad_output
+        let mut grad_v_matmul = MatMul::new();
+        let attn_t = attention_weights.transpose()?;
+        let grad_v = grad_v_matmul.run(&[&GeneralTensor::Float(attn_t), &GeneralTensor::Float(grad_output.clone())], false)?;
+
+        // grad_attention_weights = grad_output @ v^T
+        let mut grad_attn_matmul = MatMul::new();
+        let v_t = v_head.transpose()?;
+        let grad_attention_weights = grad_attn_matmul.run(&[&GeneralTensor::Float(grad_output.clone()), &GeneralTensor::Float(v_t)], false)?;
+
+        // Gradient through softmax
+        let grad_masked_qk = self.softmax_backward(&attention_weights, &grad_attention_weights)?;
+
+        // Gradient through scaling
+        let mut grad_scaled_qk = grad_masked_qk.clone();
+        let grad_blob = grad_scaled_qk.blob_mut();
+        for val in grad_blob.iter_mut() {
+            *val *= self.scale;
+        }
+
+        // Gradient through Q @ K^T
+        // grad_q = grad_scaled_qk @ k
+        let mut grad_q_matmul = MatMul::new();
+        let grad_q = grad_q_matmul.run(&[&GeneralTensor::Float(grad_scaled_qk.clone()), &GeneralTensor::Float(k_head.clone())], false)?;
+
+        // grad_k = grad_scaled_qk^T @ q
+        let mut grad_k_matmul = MatMul::new();
+        let grad_scaled_qk_t = grad_scaled_qk.transpose()?;
+        let grad_k = grad_k_matmul.run(&[&GeneralTensor::Float(grad_scaled_qk_t), &GeneralTensor::Float(q_head.clone())], false)?;
+
+        Ok((grad_q, grad_k, grad_v))
+    }
+
+    /// Backward pass through softmax
+    fn softmax_backward(&self, softmax_output: &Tensor<f32>, grad_output: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
+        let shape = softmax_output.shape();
+        let seq_len = shape[shape.len() - 2];
+        let mut grad_input = Tensor::zeros(shape);
+        
+        let softmax_blob = softmax_output.blob();
+        let grad_out_blob = grad_output.blob();
+        let grad_in_blob = grad_input.blob_mut();
+        
+        // For each row (query position)
+        for i in 0..seq_len {
+            let row_start = i * seq_len;
+            let row_end = row_start + seq_len;
+            
+            // Compute sum of (grad_output * softmax_output) for this row
+            let mut sum = 0.0;
+            for j in row_start..row_end {
+                if j < softmax_blob.len() && j < grad_out_blob.len() {
+                    sum += grad_out_blob[j] * softmax_blob[j];
+                }
+            }
+            
+            // Compute gradient: softmax * (grad_output - sum)
+            for j in row_start..row_end {
+                if j < grad_in_blob.len() && j < softmax_blob.len() && j < grad_out_blob.len() {
+                    grad_in_blob[j] = softmax_blob[j] * (grad_out_blob[j] - sum);
+                }
+            }
+        }
+        
+        Ok(grad_input)
+    }
+
+    /// Accumulate head gradients back to full tensor
+    fn accumulate_head_gradients(
+        &self,
+        full_grad: &mut Tensor<f32>,
+        head_grad: &Tensor<f32>,
+        head_start: usize,
+        head_end: usize,
+    ) -> Result<(), TensorError> {
+        let shape = full_grad.shape();
+        let seq_len = shape[shape.len() - 2];
+        let embed_dim = shape[shape.len() - 1];
+        
+        let full_blob = full_grad.blob_mut();
+        let head_blob = head_grad.blob();
+        
+        for i in 0..seq_len {
+            for (j, head_j) in (head_start..head_end).enumerate() {
+                let full_idx = i * embed_dim + head_j;
+                let head_idx = i * self.head_dim + j;
+                
+                if full_idx < full_blob.len() && head_idx < head_blob.len() {
+                    full_blob[full_idx] += head_blob[head_idx];
+                }
+            }
+        }
+        
+        Ok(())
     }
 }
 
