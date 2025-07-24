@@ -13,11 +13,13 @@ mod coeff;
 mod crossentropy;
 mod dropout;
 mod embedding;
+mod flash_attention;
 mod gelu;
 mod layer_norm;
 mod matmul;
 mod relu;
 mod softmax;
+mod standard_attention;
 mod transpose;
 mod trilmask;
 
@@ -27,11 +29,13 @@ pub use coeff::*;
 pub use crossentropy::*;
 pub use dropout::*;
 pub use embedding::*;
+pub use flash_attention::*;
 pub use gelu::*;
 pub use layer_norm::*;
 pub use matmul::*;
 pub use relu::*;
 pub use softmax::*;
+pub use standard_attention::*;
 pub use transpose::*;
 pub use trilmask::*;
 

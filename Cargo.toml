@@ -19,5 +19,22 @@ thiserror = "1.0"
 ocl = { version = "0.19", optional = true }
 structopt = { version = "0.3", default-features = false }
 
+[dev-dependencies]
+proptest = "1.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+approx = "0.5"
+
 [features]
 gpu = ["ocl"]
+
+[[bench]]
+name = "tensor_ops"
+harness = false
+
+[[bench]]
+name = "training_benchmark"
+harness = false
+
+[[bench]]
+name = "flash_attention_benchmark"
+harness = false
